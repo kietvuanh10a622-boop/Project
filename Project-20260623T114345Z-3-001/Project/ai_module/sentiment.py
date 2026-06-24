@@ -1,73 +1,117 @@
 # ai_module/sentiment.py
 import logging
-from textblob import TextBlob
-from deep_translator import GoogleTranslator
+import time
+import json
+import google.generativeai as genai
+
+# ĐIỀN GEMINI API KEY CỦA BẠN VÀO ĐÂY (Lấy miễn phí tại aistudio.google.com)
+GEMINI_API_KEY = "AQ.Ab8RN6LbmruohNrKxSHoi-GavGHz_E9eMRehz1blUc6EjILKDg"
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Sử dụng gemini-1.5-flash (Tốc độ cực nhanh, giá rẻ/miễn phí, hoàn hảo cho Data Pipeline)
+# Hoặc đổi thành 'gemini-1.5-pro' nếu bạn muốn suy luận cực sâu
+MODEL_NAME = 'gemini-1.5-flash'
+
+def call_gemini_sentiment_api(text_to_analyze):
+    """
+    Gọi Gemini API để phân tích cảm xúc bài báo với JSON Schema nghiêm ngặt.
+    """
+    try:
+        model = genai.GenerativeModel(
+            model_name=MODEL_NAME,
+            # Ép Gemini bắt buộc phải trả về JSON để không làm vỡ Data Pipeline
+            generation_config={"response_mime_type": "application/json"}
+        )
+        
+        # Thiết kế Prompt đóng vai chuyên gia tài chính/công nghệ
+        prompt = f"""
+        Bạn là một chuyên gia phân tích thị trường công nghệ và bán dẫn. 
+        Hãy phân tích cảm xúc (sentiment) của tiêu đề bài báo sau đây.
+        Trả về kết quả ĐÚNG định dạng JSON với 2 key sau, không kèm giải thích gì thêm:
+        - "label": Chỉ chọn 1 trong 3 chữ "Positive", "Negative", hoặc "Neutral".
+        - "score": Điểm số (float) từ -1.0 (rất tiêu cực) đến 1.0 (rất tích cực). 0.0 là trung tính.
+        
+        Tiêu đề báo: "{text_to_analyze}"
+        """
+        
+        response = model.generate_content(prompt)
+        
+        # Chuyển đổi chuỗi JSON mà Gemini trả về thành Dictionary của Python
+        result = json.loads(response.text)
+        
+        label = result.get('label', 'Neutral').capitalize()
+        score = float(result.get('score', 0.0))
+        
+        # Chuẩn hóa để chống lỗi nếu Gemini lỡ sinh ra nhãn lạ
+        if label not in ['Positive', 'Negative', 'Neutral']:
+            label = 'Neutral'
+            
+        return {"score": score, "label": label}
+        
+    except Exception as e:
+        logging.error(f"Lỗi khi gọi Gemini API: {e}")
+        return None
 
 def get_sentiment(text, source_name):
     """
-    Phân tích cảm xúc của văn bản. Hỗ trợ đa ngôn ngữ (Việt, Anh).
-    Trả về một dictionary chứa điểm số (score) và nhãn cảm xúc (label).
+    Hàm xử lý chính (Đã lược bỏ khâu dịch thuật vì Gemini hiểu tiếng Việt xuất sắc)
     """
+    if not text:
+        return {"score": 0.0, "label": "Neutral"}
+
     try:
-        if not text:
-            return {"score": 0.0, "label": "Trung tính"}
-
-        text_to_analyze = text
-
-        # XỬ LÝ ĐA NGÔN NGỮ (Điểm cộng cực lớn cho đồ án)
-        # Nếu nguồn là VnExpress (Tiếng Việt), ta dịch sang tiếng Anh trước
-        if source_name == "VnExpress":
-            # Dịch tối đa 4999 ký tự để tránh giới hạn độ dài của Google Translator
-            text_to_analyze = GoogleTranslator(source='vi', target='en').translate(text[:4999])
-
-        # Phân tích cảm xúc bằng TextBlob
-        blob = TextBlob(text_to_analyze)
-        score = blob.sentiment.polarity  # Điểm chạy từ -1.0 (Rất tiêu cực) đến 1.0 (Rất tích cực)
-
-        # Đặt ngưỡng phân loại cảm xúc
-        if score > 0.1:
-            label = "Tích cực"
-        elif score < -0.1:
-            label = "Tiêu cực"
+        # BỎ QUA BƯỚC DỊCH THUẬT: Đưa thẳng văn bản gốc (cả Anh lẫn Việt) vào Gemini
+        api_result = call_gemini_sentiment_api(text)
+        
+        if api_result:
+            return api_result
+            
+        # FALLBACK: Nếu API Google quá tải hoặc hết Quota, dùng thuật toán Keyword nội bộ
         else:
-            label = "Trung tính"
-
-        # Làm tròn điểm đến 3 chữ số thập phân cho đẹp
-        return {"score": round(score, 3), "label": label}
+            logging.info("Sử dụng Fallback Keyword-based do Gemini API lỗi...")
+            lower_text = text.lower()
+            positive_words = ['surge', 'growth', 'profit', 'up', 'build', 'new', 'innovation', 'invest', 'revenue', 'tăng', 'lãi', 'đột phá', 'phát triển', 'xây']
+            negative_words = ['drop', 'fall', 'shortage', 'crisis', 'down', 'loss', 'delay', 'cut', 'ban', 'risk', 'giảm', 'lỗ', 'khủng hoảng', 'cấm', 'thiếu hụt']
+            
+            pos_count = sum(1 for word in positive_words if word in lower_text)
+            neg_count = sum(1 for word in negative_words if word in lower_text)
+            
+            if pos_count > neg_count:
+                return {"score": 0.65, "label": "Positive"}
+            elif neg_count > pos_count:
+                return {"score": -0.65, "label": "Negative"}
+            else:
+                return {"score": 0.0, "label": "Neutral"}
 
     except Exception as e:
-        logging.error(f"Lỗi AI khi phân tích văn bản: {e}")
-        return {"score": 0.0, "label": "Trung tính"}
+        logging.error(f"Lỗi Pipeline Sentiment: {e}")
+        return {"score": 0.0, "label": "Neutral"}
 
 def apply_sentiment_analysis(articles):
     """
-    Nhận vào danh sách bài báo đã làm sạch, áp dụng phân tích cảm xúc cho từng bài.
+    Nhận danh sách bài báo, áp dụng phân tích cảm xúc từ Gemini cho từng bài.
     """
-    logging.info("--- BƯỚC C2: BẮT ĐẦU PHÂN TÍCH CẢM XÚC BẰNG AI (SP4) ---")
+    logging.info("--- BƯỚC C2: KẾT NỐI GOOGLE GEMINI 1.5 API ---")
     analyzed_articles = []
     
     total_articles = len(articles)
     for index, article in enumerate(articles):
-        # In log tiến độ để người dùng/giám khảo thấy hệ thống đang chạy mượt mà
         if (index + 1) % 5 == 0 or index == 0:
-            logging.info(f"Đang dùng AI phân tích bài {index + 1}/{total_articles}...")
+            logging.info(f"Đang gửi bài {index + 1}/{total_articles} lên Google AI Cloud...")
         
-        # Thường phân tích cảm xúc dựa trên tiêu đề (title). 
-        # (Nếu có nội dung chi tiết 'content', bạn có thể thay 'title' thành 'content')
         text_to_analyze = article.get('title', '')
         source_name = article.get('source_name', 'Unknown')
         
-        # Gọi hàm AI
         sentiment_result = get_sentiment(text_to_analyze, source_name)
         
-        # Cập nhật kết quả vào dictionary của bài báo
-        # Lưu ý: Biến 'sentiment_score' phải khớp với schema database của bạn
         article['sentiment_score'] = sentiment_result['score']
-        
-        # Có thể lưu thêm nhãn (Positive/Negative) nếu bảng SQLite của bạn hỗ trợ
         article['sentiment_label'] = sentiment_result['label'] 
         
         analyzed_articles.append(article)
         
-    logging.info("--- HOÀN THÀNH PHÂN TÍCH CẢM XÚC ---")
+        # Tránh bị Rate Limit (Tối đa 15 request/phút với tier miễn phí của Gemini)
+        # Khuyên dùng time.sleep(4) nếu dữ liệu quá nhiều
+        time.sleep(2) 
+        
+    logging.info("--- HOÀN THÀNH GỌI GEMINI API ---")
     return analyzed_articles
